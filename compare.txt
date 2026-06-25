@@ -1,0 +1,12 @@
+﻿MOBNA spec_ids == sku_keys? True
+MOBNA spec count dims 1
+MOBNA sku count 7
+python : Traceback (most recent call last):
+所在位置 C:\Users\33097\AppData\Local\Temp\ps-script-ffc913a3-9538-47b4-a482-bda5c9d36fe6.ps1:132 字符: 1
++ python -c "
++ ~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "<string>", line 19, in <module>
+KeyError: 'specs'
