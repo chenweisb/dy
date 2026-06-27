@@ -1,6 +1,6 @@
 /**
- * 抖音 Android SSL Pinning bypass（Java + Native，配合 mitmproxy）
- * 用法: python run_spy.py  （冷启动 spawn，勿用 --attach）
+ * 抖音 SSL bypass — 纯 native（抖音屏蔽 Frida Java 桥）
+ * 推荐: python run_spy.py  （spawn 冷启动）
  */
 (function () {
   "use strict";
@@ -20,216 +20,194 @@
     }
   }
 
-  // ---------- Native (Cronet/BoringSSL，商城走这层) ----------
+  function findExport(lib, name) {
+    try {
+      if (!lib) return Module.findGlobalExportByName(name);
+      var mod = Process.findModuleByName(lib);
+      return mod ? mod.findExportByName(name) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 只 hook 网络相关 so，不扫描整个 APK（避免刷屏和误 hook）
+  function isNetworkModule(mod) {
+    if (!mod || !mod.name) return false;
+    return /ttnet|sscronet|ttboringssl|cronet|vcn|boringssl/i.test(mod.name);
+  }
+
+  var nativeHooked = {};
+  var javaDone = false;
+  var readyLogged = false;
+  var networkLibsLogged = false;
+
+  var trustVerifyCb = new NativeCallback(
+    function (ssl, out_alert) {
+      return 0;
+    },
+    "int",
+    ["pointer", "pointer"]
+  );
+
+  var SSL_FUNCS = [
+    "SSL_CTX_set_custom_verify",
+    "SSL_set_custom_verify",
+    "SSL_get_verify_result",
+    "SSL_CTX_set_verify",
+    "SSL_set_verify",
+    "SSL_CTX_set_cert_verify_callback",
+  ];
+
+  function markNativeReady(extra) {
+    if (readyLogged) return;
+    readyLogged = true;
+    log("native 就绪 — " + (extra || "请进商城点商品"));
+  }
+
   function hookNativeSsl() {
     var hooked = 0;
+    var netLibs = [];
 
-    function attachVerify(name, lib) {
-      var addr = Module.findExportByName(lib, name);
+    function attachAt(name, modName, addr) {
+      var key = name + "@" + modName;
+      if (nativeHooked[key] || !addr) return false;
+      try {
+        if (name.indexOf("set_custom_verify") !== -1 || name.indexOf("cert_verify_callback") !== -1) {
+          Interceptor.attach(addr, {
+            onEnter: function (args) {
+              if (args[2]) args[2] = trustVerifyCb;
+            },
+          });
+        } else if (name.indexOf("set_verify") !== -1) {
+          Interceptor.attach(addr, {
+            onEnter: function (args) {
+              if (args[1]) args[1] = trustVerifyCb;
+            },
+          });
+        } else if (name === "SSL_get_verify_result") {
+          Interceptor.attach(addr, {
+            onLeave: function (retval) {
+              retval.replace(0);
+            },
+          });
+        }
+        nativeHooked[key] = true;
+        hooked++;
+        log("native " + name + " @" + modName);
+        if (/ttnet/i.test(modName)) markNativeReady("libttnet 已 hook");
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function attachX509(mod) {
+      var key = "X509_verify_cert@" + mod.name;
+      if (nativeHooked[key]) return;
+      var addr = mod.findExportByName("X509_verify_cert");
       if (!addr) return;
       try {
         Interceptor.attach(addr, {
-          onEnter: function (args) {
-            if (name.indexOf("set_custom_verify") !== -1 && args[2]) {
-              var cb = new NativeCallback(
-                function (ssl, out_alert) {
-                  return 0;
-                },
-                "int",
-                ["pointer", "pointer"]
-              );
-              args[2] = cb;
-            }
+          onLeave: function (retval) {
+            if (retval.toInt32() <= 0) retval.replace(1);
           },
         });
+        nativeHooked[key] = true;
         hooked++;
-        log("native " + name + " @" + (lib || "null"));
-      } catch (e) {
-        log("native " + name + " fail: " + e);
-      }
+        log("native X509_verify_cert @" + mod.name);
+        if (/ttnet/i.test(mod.name)) markNativeReady("libttnet 已 hook");
+      } catch (e) {}
     }
 
-    ["SSL_CTX_set_custom_verify", "SSL_set_custom_verify"].forEach(function (name) {
-      attachVerify(name, null);
-      attachVerify(name, "libttnet.so");
-      attachVerify(name, "libssl.so");
-      attachVerify(name, "libboringssl.so");
-    });
-
-    var getVerify = Module.findExportByName(null, "SSL_get_verify_result");
-    if (getVerify) {
-      Interceptor.replace(
-        getVerify,
-        new NativeCallback(
-          function () {
-            return 0;
-          },
-          "long",
-          ["pointer"]
-        )
-      );
-      hooked++;
-      log("native SSL_get_verify_result -> 0");
-    }
-
-    if (hooked === 0) {
-      log("native: 未找到 SSL 符号，依赖 Java 层 hook");
-    }
-  }
-
-  // ---------- Java ----------
-  function hookTrustManagers() {
-    var TrustManagerImpl = Java.use("com.android.org.conscrypt.TrustManagerImpl");
-
-    TrustManagerImpl.verifyChain.implementation = function (
-      untrustedChain,
-      trustAnchorChain,
-      host,
-      clientAuth,
-      ocspData,
-      tlsSctData
-    ) {
-      return untrustedChain;
-    };
-
-    if (TrustManagerImpl.checkTrustedRecursive) {
-      TrustManagerImpl.checkTrustedRecursive.overloads.forEach(function (overload) {
-        overload.implementation = function () {
-          return arguments[0];
-        };
+    Process.enumerateModules().forEach(function (mod) {
+      if (!isNetworkModule(mod)) return;
+      netLibs.push(mod.name);
+      SSL_FUNCS.forEach(function (name) {
+        attachAt(name, mod.name, mod.findExportByName(name));
       });
-    }
-
-    TrustManagerImpl.checkServerTrusted.overloads.forEach(function (overload) {
-      overload.implementation = function () {
-        var ret = overload.returnType.className;
-        if (ret.indexOf("[") === 0) {
-          return arguments[0];
-        }
-      };
-    });
-  }
-
-  function hookSslContext() {
-    var X509TrustManager = Java.use("javax.net.ssl.X509TrustManager");
-    var SSLContext = Java.use("javax.net.ssl.SSLContext");
-
-    var TrustAll = Java.registerClass({
-      name: "com.dyspy.TrustAllManager2",
-      implements: [X509TrustManager],
-      methods: {
-        checkClientTrusted: function () {},
-        checkServerTrusted: function () {},
-        getAcceptedIssuers: function () {
-          return [];
-        },
-      },
+      attachX509(mod);
     });
 
-    SSLContext.init.overload(
-      "[Ljavax.net.ssl.KeyManager;",
-      "[Ljavax.net.ssl.TrustManager;",
-      "java.security.SecureRandom"
-    ).implementation = function (km, tm, sr) {
-      this.init(km, [TrustAll.$new()], sr);
-    };
-  }
-
-  function hookOkHttp() {
-    ["okhttp3.CertificatePinner", "com.squareup.okhttp.CertificatePinner"].forEach(function (cls) {
-      try {
-        var Pinner = Java.use(cls);
-        Pinner.check.overloads.forEach(function (ol) {
-          ol.implementation = function () {};
-        });
-        log(cls + " OK");
-      } catch (e) {
-        log(cls + " skip");
+    if (!networkLibsLogged) {
+      networkLibsLogged = true;
+      log("网络 so: " + (netLibs.length ? netLibs.join(", ") : "暂无"));
+      if (netLibs.join(",").indexOf("ttnet") === -1) {
+        log("⚠ 尚无 libttnet.so，进商城后若出现「so 加载: libttnet.so」即正常");
       }
-    });
-  }
-
-  function hookHostnameVerifier() {
-    var HV = Java.registerClass({
-      name: "com.dyspy.TrustAllHostnameVerifier2",
-      implements: [Java.use("javax.net.ssl.HostnameVerifier")],
-      methods: {
-        verify: function () {
-          return true;
-        },
-      },
-    });
-    var HUC = Java.use("javax.net.ssl.HttpsURLConnection");
-    HUC.setDefaultHostnameVerifier.implementation = function () {
-      this.setDefaultHostnameVerifier(HV.$new());
-    };
-    HUC.setHostnameVerifier.implementation = function () {
-      this.setHostnameVerifier(HV.$new());
-    };
-  }
-
-  function hookCronetJava() {
-    try {
-      var Builder = Java.use("com.ttnet.org.chromium.net.impl.CronetEngineBuilderImpl");
-      Builder.enablePublicKeyPinningBypassForLocalTrustAnchors.implementation = function () {
-        return this.enablePublicKeyPinningBypassForLocalTrustAnchors(true);
-      };
-    } catch (e) {
-      log("CronetEngineBuilder skip");
     }
 
-    ["com.ttnet.org.chromium.net.AndroidNetworkLibrary", "com.ttnet.org.chromium.net.X509Util"].forEach(
-      function (cls) {
+    if (hooked > 0 && !readyLogged) markNativeReady("请进商城点商品");
+    return hooked;
+  }
+
+  function scheduleNativeRetries() {
+    var round = 0;
+    var idle = 0;
+    var timer = setInterval(function () {
+      round++;
+      var n = hookNativeSsl();
+      if (n > 0) {
+        idle = 0;
+        log("native 补 hook +" + n);
+      } else {
+        idle++;
+      }
+      if (idle >= 5 || round >= 30) clearInterval(timer);
+    }, 2000);
+  }
+
+  function hookNativeOnModuleLoad() {
+    var dlopen = findExport(null, "android_dlopen_ext") || findExport(null, "dlopen");
+    if (!dlopen) return;
+    Interceptor.attach(dlopen, {
+      onEnter: function (args) {
         try {
-          var Lib = Java.use(cls);
-          Lib.verifyServerCertificates.overloads.forEach(function (ol) {
-            ol.implementation = function () {
-              return arguments[0];
-            };
-          });
-          log(cls + " OK");
+          this.path = args[0].readUtf8String() || "";
         } catch (e) {
-          log(cls + " skip");
+          this.path = "";
         }
-      }
-    );
-  }
-
-  function hookOk3TlsCallback() {
-    try {
-      var CB = Java.use("com.bytedance.frameworks.baselib.network.http.ok3.impl.Ok3TlsProcessCallback");
-      CB.verify.overloads.forEach(function (ol) {
-        ol.implementation = function () {
-          return true;
-        };
-      });
-      log("Ok3TlsProcessCallback OK");
-    } catch (e) {
-      log("Ok3TlsProcessCallback skip");
-    }
-  }
-
-  function hookNetworkSecurityPolicy() {
-    var NSP = Java.use("android.security.NetworkSecurityPolicy");
-    NSP.isCleartextTrafficPermitted.overloads.forEach(function (ol) {
-      ol.implementation = function () {
-        return true;
-      };
+      },
+      onLeave: function () {
+        if (!this.path) return;
+        var base = this.path.split("/").pop();
+        if (isNetworkModule({ name: base, path: this.path })) {
+          log("so 加载: " + base);
+          hookNativeSsl();
+        }
+      },
     });
+    log("dlopen watcher OK");
   }
 
-  // Native 尽早装，不等 Java.perform
-  tryHook("NativeSSL", hookNativeSsl);
+  function runJavaHooks() {
+    if (javaDone) return;
+    javaDone = true;
+    try {
+      Java.use("com.ttnet.org.chromium.net.impl.CronetEngineBuilderImpl")
+        .enablePublicKeyPinningBypassForLocalTrustAnchors.implementation = function () {
+          return this.enablePublicKeyPinningBypassForLocalTrustAnchors(true);
+        };
+    } catch (e) {}
+    log("Java 层就绪");
+  }
 
-  Java.perform(function () {
-    log("Java.perform start");
-    tryHook("TrustManagers", hookTrustManagers);
-    tryHook("SslContext", hookSslContext);
-    hookOkHttp();
-    tryHook("HostnameVerifier", hookHostnameVerifier);
-    hookCronetJava();
-    hookOk3TlsCallback();
-    tryHook("NetworkSecurityPolicy", hookNetworkSecurityPolicy);
-    log("就绪 — 现在可以进商城；mitmproxy 不应再出现 certificate unknown");
-  });
+  function tryJavaBackground() {
+    var n = 0;
+    var timer = setInterval(function () {
+      n++;
+      try {
+        if (typeof Java !== "undefined") {
+          Java.perform(runJavaHooks);
+          clearInterval(timer);
+          return;
+        }
+      } catch (e) {}
+      if (n >= 3) clearInterval(timer);
+    }, 1000);
+  }
+
+  tryHook("NativeSSL", hookNativeSsl);
+  tryHook("DlopenWatcher", hookNativeOnModuleLoad);
+  scheduleNativeRetries();
+  tryJavaBackground();
 })();

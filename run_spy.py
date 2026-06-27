@@ -49,11 +49,21 @@ def check_frida_server(device) -> int:
 
 
 def find_douyin_pid(device) -> int | None:
+    """优先 attach 主进程 com.ss.android.ugc.aweme（非 :push 等子进程）。"""
+    exact = None
+    fallback = None
     for proc in device.enumerate_processes():
-        name = (proc.name or "").lower()
-        if name in (PACKAGE_NAME, "抖音", "douyin") or PACKAGE_NAME in name:
+        name = proc.name or ""
+        if name == PACKAGE_NAME:
             return proc.pid
-    return None
+        lower = name.lower()
+        if lower in ("抖音", "douyin"):
+            fallback = proc.pid
+        elif PACKAGE_NAME in lower and ":" not in name:
+            exact = proc.pid
+        elif PACKAGE_NAME in lower and not fallback:
+            fallback = proc.pid
+    return exact or fallback
 
 
 def connect_session(device, attach_only: bool) -> tuple:
@@ -96,12 +106,21 @@ def print_gadget_help():
     print("若无 Root，本方案不可行。")
 
 
+def print_cert_help():
+    print("\n=== mitm 证书（certificate unknown 时必做）===\n")
+    print("1. 手机浏览器打开 http://mitm.it 安装 mitmproxy 证书")
+    print("2. 小米/MIUI 必须 Root + Magisk 模块「Move Certificates」或「MagiskTrustUserCreds」")
+    print("   把用户证书移到【系统信任区】，然后重启手机")
+    print("3. 验证: 设置 → 安全 → 加密与凭据 → 受信任的凭据 → 【系统】里应有 mitmproxy")
+    print("4. 仅装用户证书不够，Android 7+ 抖音会忽略用户区 CA\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Frida SSL bypass for Douyin + mitmproxy")
     parser.add_argument(
         "--attach",
         action="store_true",
-        help="attach 到已运行的抖音（spawn 失败时用此模式）",
+        help="attach 到已运行的抖音（不推荐：SSL 可能在注入前已初始化）",
     )
     args = parser.parse_args()
 
@@ -121,16 +140,20 @@ def main():
 
         session, pid, used_attach = connect_session(device, args.attach)
 
-        load_script(session)
-        time.sleep(0.8)
-        print("[*] SSL bypass 已注入")
-        print("[*] ① mitmproxy 已开  ② 手机代理=电脑IP:8080  ③ 证书已装 d:\\dy\\certs\\")
-
         if used_attach:
-            print("[*] attach 模式: 请【完全杀掉抖音再重新打开】让 hook 在启动时生效，然后再进商城")
+            print("[!] attach 模式: 若 ecombdapi 仍 certificate unknown，请改用 spawn:")
+            print("    完全杀掉抖音 → python run_spy.py")
+            load_script(session)
         else:
+            load_script(session)
+            print("[*] 正在 resume 抖音（冷启动，hook 在 SSL 初始化前生效）…")
             device.resume(pid)
-            print("[*] 抖音已 resume，请等首页加载完再进商城")
+            time.sleep(2.0)
+
+        print("[*] SSL bypass 脚本已加载")
+        print("[*] mitmproxy 端口 8080，手机代理=电脑IP:8080")
+        print("[*] 看到「native 就绪」后进商城；mitm 里 ecombdapi 应无 certificate unknown")
+        print_cert_help()
 
         input("[*] 保持本窗口运行，按 Enter 退出...\n")
 
