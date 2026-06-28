@@ -2,11 +2,13 @@
 
 import json
 import re
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
 BAOJS_DIR = Path(__file__).with_name("baojs")
 BAOTXT_DIR = Path(__file__).with_name("baotxt")
+_write_lock = threading.Lock()
 
 SIZE_PATTERN = re.compile(r"^(XS|S|M|L|XL|2XL|3XL|4XL|5XL|\d+XL|\d+)$", re.I)
 IMAGE_HOST_KEYWORDS = ("ecombdimg.com", "douyinpic.com", "byteimg.com")
@@ -526,7 +528,7 @@ def _build_specs_and_skus(
     if not spec_items:
         return [], {}, {}
 
-    spec_name = spec_dims[0]["name"] if len(spec_dims) == 1 else "规格"
+    spec_name = spec_dims[0]["name"] if len(spec_dims) == 1 else "颜色分类"
     return [_spec_block(spec_name, spec_items)], skus, small_pic
 
 
@@ -552,6 +554,114 @@ def validate_package(package: dict) -> list[str]:
         if spec_ids != sku_keys:
             errors.append(f"spec id 与 sku key 不一致: {len(spec_ids)} vs {len(sku_keys)}")
     return errors
+
+
+def _order_content_item(item: dict) -> dict:
+    return {
+        "width": item.get("width") or 1080,
+        "url": item.get("url") or "",
+        "height": item.get("height") or 1080,
+    }
+
+
+def _order_main_imgs(main_imgs: list) -> list:
+    blocks = []
+    for block in main_imgs or []:
+        blocks.append(
+            {
+                "content_list": [_order_content_item(i) for i in block.get("content_list") or []],
+                "name": block.get("name") or "商品",
+                "type": block.get("type") or "image",
+            }
+        )
+    return blocks
+
+
+def _order_detail_img(img: dict) -> dict:
+    return {
+        "height": img.get("height") or 1080,
+        "data_size": img.get("data_size") or 0,
+        "uri": img.get("uri") or "",
+        "url_list": img.get("url_list") or [],
+        "width": img.get("width") or 1080,
+    }
+
+
+def _order_spec_item(item: dict) -> dict:
+    return {
+        "id": str(item.get("id") or ""),
+        "name": item.get("name") or "",
+        "default_select": bool(item.get("default_select", False)),
+        "icon": item.get("icon"),
+        "price": item.get("price") or "",
+    }
+
+
+def _order_spec(spec: dict) -> dict:
+    return {
+        "name": spec.get("name") or "颜色分类",
+        "spec_items": [_order_spec_item(i) for i in spec.get("spec_items") or []],
+        "hide_spec": bool(spec.get("hide_spec", False)),
+        "default_select": bool(spec.get("default_select", False)),
+        "spec_type": spec.get("spec_type") if spec.get("spec_type") is not None else 0,
+        "show_big_pic": bool(spec.get("show_big_pic", True)),
+        "show_small_pic": bool(spec.get("show_small_pic", True)),
+        "spec_mode": spec.get("spec_mode") if spec.get("spec_mode") is not None else 2,
+    }
+
+
+def _order_sku_entry(entry: dict) -> dict:
+    return {
+        "price": entry.get("price") or 0,
+        "discount_price": entry.get("discount_price") or entry.get("price") or 0,
+        "stock": entry.get("stock") if entry.get("stock") is not None else 0,
+    }
+
+
+def format_package_mobna(package: dict) -> str:
+    """按 mobna.txt 的字段顺序 + 紧凑 JSON（无空格）序列化。"""
+    skus = package.get("skus") or {}
+    ordered = {
+        "main_imgs": _order_main_imgs(package.get("main_imgs") or []),
+        "goods_title": package.get("goods_title") or "",
+        "price": package.get("price") or 0,
+        "goods_id": str(package.get("goods_id") or ""),
+        "product_format": package.get("product_format") or [{"format": [], "media_elements": None}],
+        "detail_imgs": [_order_detail_img(i) for i in package.get("detail_imgs") or []],
+        "skus": {str(k): _order_sku_entry(v) for k, v in skus.items()},
+        "specs": [_order_spec(s) for s in package.get("specs") or []],
+        "small_pic": package.get("small_pic") or {},
+    }
+    return json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+
+
+def _verify_mobna_text(text: str) -> list[str]:
+    if not text.startswith('{"main_imgs":'):
+        return ["文件头异常（可能被截断），应以 {\"main_imgs\": 开头"]
+    try:
+        package = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return [f"JSON 不完整: {exc}"]
+    if "spec_mode" not in text:
+        return ["缺少 spec_mode 字段"]
+    return validate_package(package)
+
+
+def _write_baotxt_atomic(out: Path, text: str) -> bool:
+    errors = _verify_mobna_text(text)
+    if errors:
+        print(f"[baotxt] 写入前校验失败: {', '.join(errors)}")
+        return False
+    tmp = out.with_suffix(".tmp")
+    with _write_lock:
+        tmp.write_text(text, encoding="utf-8")
+        read_back = tmp.read_text(encoding="utf-8")
+        if read_back != text:
+            print(f"[baotxt] 临时文件写入不完整")
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(out)
+    return True
 
 
 def convert_baojs_to_package(baojs: dict) -> dict | None:
@@ -628,6 +738,10 @@ def convert_baojs_to_package(baojs: dict) -> dict | None:
     }
 
 
+def is_baojs_exportable(baojs: dict) -> bool:
+    return bool((baojs.get("product_pack") or {}).get("promotion_v3"))
+
+
 def export_baotxt(product_id: str, baojs: dict | None = None) -> Path | None:
     BAOTXT_DIR.mkdir(parents=True, exist_ok=True)
     if baojs is None:
@@ -636,6 +750,10 @@ def export_baotxt(product_id: str, baojs: dict | None = None) -> Path | None:
             return None
         baojs = json.loads(src.read_text(encoding="utf-8"))
 
+    if not is_baojs_exportable(baojs):
+        print(f"[baotxt] {product_id} baojs 不完整: 缺少 product_pack，请重新进入商品详情页")
+        return None
+
     package = convert_baojs_to_package(baojs)
     if not package:
         return None
@@ -643,13 +761,17 @@ def export_baotxt(product_id: str, baojs: dict | None = None) -> Path | None:
     errors = validate_package(package)
     if errors:
         print(f"[baotxt] {product_id} 校验失败: {', '.join(errors)}")
-        stale = BAOTXT_DIR / f"{product_id}.txt"
-        if stale.is_file():
-            stale.unlink()
+        out = BAOTXT_DIR / f"{product_id}.txt"
+        if out.is_file():
+            print(f"[baotxt] 保留已有 baotxt/{product_id}.txt，未覆盖")
         return None
 
     out = BAOTXT_DIR / f"{product_id}.txt"
-    out.write_text(json.dumps(package, ensure_ascii=False), encoding="utf-8")
+    text = format_package_mobna(package)
+    if not _write_baotxt_atomic(out, text):
+        if out.is_file():
+            print(f"[baotxt] 保留已有 baotxt/{product_id}.txt")
+        return None
     return out
 
 
@@ -671,20 +793,90 @@ def cleanup_stale_baotxt() -> int:
     return removed
 
 
-def export_all_baojs() -> int:
+def export_all_baojs() -> tuple[int, list[str]]:
     cleanup_stale_baotxt()
     count = 0
+    failed: list[str] = []
     if not BAOJS_DIR.is_dir():
-        return count
+        return count, failed
     for src in BAOJS_DIR.glob("*.json"):
         if export_baotxt(src.stem):
             count += 1
-    return count
+        else:
+            failed.append(src.stem)
+    return count, failed
+
+
+def list_incomplete_baojs() -> list[str]:
+    incomplete: list[str] = []
+    if not BAOJS_DIR.is_dir():
+        return incomplete
+    for src in BAOJS_DIR.glob("*.json"):
+        try:
+            baojs = json.loads(src.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            incomplete.append(src.stem)
+            continue
+        if not is_baojs_exportable(baojs):
+            incomplete.append(src.stem)
+    return incomplete
+
+
+def check_baojs_txt() -> tuple[list[str], list[str], list[str], list[str]]:
+    """返回 (缺 txt 的 baojs, 校验失败的 txt, 孤儿 txt, 不完整的 baojs)。"""
+    missing: list[str] = []
+    bad_txt: list[str] = []
+    orphan: list[str] = []
+    incomplete = list_incomplete_baojs()
+
+    if BAOJS_DIR.is_dir():
+        for src in BAOJS_DIR.glob("*.json"):
+            pid = src.stem
+            txt = BAOTXT_DIR / f"{pid}.txt"
+            if not txt.is_file():
+                missing.append(pid)
+                continue
+            try:
+                pkg = json.loads(txt.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                bad_txt.append(f"{pid}.txt (JSON 损坏)")
+                continue
+            errs = validate_package(pkg)
+            if errs:
+                bad_txt.append(f"{pid}.txt ({', '.join(errs)})")
+
+    if BAOTXT_DIR.is_dir():
+        baojs_ids = {p.stem for p in BAOJS_DIR.glob("*.json")} if BAOJS_DIR.is_dir() else set()
+        for txt in BAOTXT_DIR.glob("*.txt"):
+            if txt.stem not in baojs_ids:
+                orphan.append(txt.name)
+    return missing, bad_txt, orphan, incomplete
 
 
 if __name__ == "__main__":
-    total = export_all_baojs()
+    import sys
+
+    if "--check" in sys.argv:
+        missing, bad_txt, orphan, incomplete = check_baojs_txt()
+        print(f"baojs: {len(list(BAOJS_DIR.glob('*.json')))} 个, baotxt: {len(list(BAOTXT_DIR.glob('*.txt')))} 个")
+        if incomplete:
+            print(f"baojs 不完整 ({len(incomplete)}): {', '.join(incomplete)}")
+        if missing:
+            print(f"缺 txt ({len(missing)}): {', '.join(missing)}")
+        if bad_txt:
+            print(f"txt 校验失败 ({len(bad_txt)}):")
+            for item in bad_txt:
+                print(f"  - {item}")
+        if orphan:
+            print(f"无对应 baojs ({len(orphan)}): {', '.join(orphan)}")
+        if not missing and not bad_txt and not incomplete:
+            print("全部 baojs 均有有效 txt")
+        sys.exit(1 if missing or bad_txt or incomplete else 0)
+
+    total, failed = export_all_baojs()
     print(f"已导出 {total} 个王者上货数据包 -> {BAOTXT_DIR.resolve()}")
+    if failed:
+        print(f"导出失败 {len(failed)} 个: {', '.join(failed)}")
 
     ok = fail = 0
     for txt in BAOTXT_DIR.glob("*.txt"):
@@ -695,4 +887,6 @@ if __name__ == "__main__":
             print(f"  FAIL {txt.name}: {errs}")
         else:
             ok += 1
-    print(f"校验通过 {ok} 个, 失败 {fail} 个")
+    print(f"txt 校验通过 {ok} 个, 失败 {fail} 个")
+    if failed:
+        print(f"baojs 未能导出 {len(failed)} 个（见上方 [baotxt] 日志）")

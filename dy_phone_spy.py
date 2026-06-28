@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -12,7 +14,13 @@ BAOJS_DIR = Path(__file__).with_name("baojs")
 LEGACY_PRODUCTS_DIR = OUTPUT_DIR / "products"
 SUMMARY_FILE = OUTPUT_DIR / "summary.jsonl"
 _baojs_ready = False
-_last_product_id = ""
+_active_product_id = ""  # 当前详情页商品（仅 product_pack 更新）
+_pack_visit_count: dict[str, int] = {}  # 本会话内各商品进入次数
+_baojs_lock = threading.Lock()
+_export_lock = threading.Lock()
+_last_export_ts: dict[str, float] = {}
+EXPORT_DEBOUNCE_SEC = 2.0
+_PROTECTED_BAOJS_KEYS = ("product_pack", "product_skus", "product_recommend", "summary")
 
 # 只保留有价值的商品接口（白名单）
 API_RULES = {
@@ -103,7 +111,7 @@ def _find_product_id_deep(obj, depth=0) -> str:
 
 
 def _resolve_ids(query: dict, post: dict, summary: dict) -> str:
-    global _last_product_id
+    """只从当前请求解析商品 ID，不用历史 fallback（避免切换商品写错文件）。"""
     for source in (summary, post, query):
         for key in ("product_id", "promotion_id", "item_id"):
             value = source.get(key)
@@ -112,7 +120,7 @@ def _resolve_ids(query: dict, post: dict, summary: dict) -> str:
     found = _find_product_id_deep(post)
     if found:
         return found
-    return _last_product_id
+    return ""
 
 
 def _fen_to_yuan(value) -> float | None:
@@ -181,10 +189,9 @@ def _extract_summary(api_type: str, data: dict, query: dict) -> dict:
             summary["title"] = cover.get("title")
         summary["price_yuan"] = _fen_to_yuan(data.get("min_price"))
         summary["product_id"] = (
-            _find_product_id_deep(post)
+            _find_product_id_deep(query)
             or query.get("product_id")
             or query.get("promotion_id")
-            or _last_product_id
         )
 
     return {k: v for k, v in summary.items() if v not in (None, "", [])}
@@ -218,7 +225,7 @@ def ensure_baojs_ready() -> None:
     if migrated:
         print(f"[baojs] 已自动迁移 {migrated} 个商品文件 -> {BAOJS_DIR.resolve()}")
 
-    exported = export_all_baojs()
+    exported = export_all_baojs()[0]
     if exported:
         print(f"[baotxt] 已自动生成 {exported} 个王者上货数据包 -> {BAOTXT_DIR.resolve()}")
 
@@ -237,32 +244,172 @@ def _load_product_file(product_id: str) -> dict:
     return {}
 
 
-def _save_product(product_id: str, patch: dict) -> None:
-    global _last_product_id
-    ensure_baojs_ready()
-    raw_file = BAOJS_DIR / f"{product_id}.json"
+def _has_product_pack(baojs: dict) -> bool:
+    return bool((baojs.get("product_pack") or {}).get("promotion_v3"))
 
-    existing = _load_product_file(product_id)
+
+def _merge_baojs(existing: dict, patch: dict) -> dict:
     merged = {**existing, **patch}
     for key in ("detail", "recommend", "skus"):
         if key in existing and key in patch and isinstance(existing[key], dict) and isinstance(patch[key], dict):
             merged[key] = {**existing[key], **patch[key]}
 
-    with raw_file.open("w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
+    for key in _PROTECTED_BAOJS_KEYS:
+        if key not in existing:
+            continue
+        if key not in patch:
+            merged[key] = existing[key]
+            continue
 
-    _last_product_id = product_id
+        old = existing[key]
+        new = patch[key]
+        if key == "product_pack":
+            if _has_product_pack(existing) and not _has_product_pack({"product_pack": new}):
+                merged[key] = old
+        elif key == "product_skus" and old and not new:
+            merged[key] = old
+        elif key == "summary":
+            if isinstance(old, dict) and isinstance(new, dict):
+                merged[key] = {
+                    **old,
+                    **{k: v for k, v in new.items() if v not in (None, "", [], {})},
+                }
+            elif old and not new:
+                merged[key] = old
+
+    if _has_product_pack(existing) and not _has_product_pack(merged):
+        merged["product_pack"] = existing["product_pack"]
+        if existing.get("summary") and not merged.get("summary"):
+            merged["summary"] = existing["summary"]
+        print(f"[baojs] 警告: {merged.get('product_id')} 保留已有 product_pack，拒绝被不完整数据覆盖")
+
+    return merged
+
+
+def _write_baojs_atomic(raw_file: Path, data: dict) -> None:
+    tmp = raw_file.with_suffix(".json.tmp")
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(raw_file)
+
+
+def _baotxt_path(product_id: str) -> Path:
+    return BAOTXT_DIR / f"{product_id}.txt"
+
+
+def _run_export_baotxt(product_id: str, merged: dict, *, updating: bool) -> bool:
+    """导出 baotxt；updating=True 时做 debounce，避免 pack/skus 连发重复写。"""
+    txt_path = _baotxt_path(product_id)
+    had_txt = txt_path.is_file()
+    if updating and had_txt:
+        now = time.time()
+        with _export_lock:
+            last = _last_export_ts.get(product_id, 0)
+            if now - last < EXPORT_DEBOUNCE_SEC:
+                print(f"[baotxt] 跳过重复导出 baotxt/{product_id}.txt（{EXPORT_DEBOUNCE_SEC}s 内）")
+                return False
+            _last_export_ts[product_id] = now
 
     baotxt_path = export_baotxt(product_id, merged)
     if baotxt_path:
-        print(f"[baotxt] 已生成 baotxt/{product_id}.txt")
+        action = "已更新" if had_txt else "已生成"
+        print(f"[baotxt] {action} baotxt/{product_id}.txt")
         if not merged.get("product_skus"):
             print("[baotxt] 提示: 未抓到 SKU 面板，各规格价格可能相同，请在详情页点击「选规格」")
-    elif not (merged.get("product_pack") or {}).get("promotion_v3"):
-        print(f"[baotxt] 跳过 baotxt/{product_id}.txt（缺少 product_pack，需进入商品详情页）")
+        return True
+
+    if not (merged.get("product_pack") or {}).get("promotion_v3"):
+        print(f"[baotxt] 跳过 baotxt/{product_id}.txt（数据未齐，请点「选规格」或再次进入商品）")
+    return False
+
+
+def _save_product(product_id: str, patch: dict, *, export_txt: bool = False) -> bool:
+    ensure_baojs_ready()
+    raw_file = BAOJS_DIR / f"{product_id}.json"
+
+    with _baojs_lock:
+        existing = _load_product_file(product_id)
+        merged = _merge_baojs(existing, patch)
+        _write_baojs_atomic(raw_file, merged)
+
+    if export_txt:
+        return _run_export_baotxt(product_id, merged, updating=True)
+
+    if not _baotxt_path(product_id).is_file():
+        return _run_export_baotxt(product_id, merged, updating=False)
+    return False
+
+
+def _should_export_txt(product_id: str, api_type: str) -> bool:
+    """切换商品不改其它 txt；当前商品：缺 txt 则生成，点选规格或再次进入则更新。"""
+    global _pack_visit_count
+    if api_type == "product_skus" and product_id == _active_product_id:
+        return True
+    if api_type == "product_pack":
+        n = _pack_visit_count.get(product_id, 0) + 1
+        _pack_visit_count[product_id] = n
+        if not _baotxt_path(product_id).is_file():
+            return True
+        return n >= 2
+    return False
+
+
+def ingest_api_response(api_type: str, data: dict, product_id: str | None = None) -> bool:
+    """Frida 内循环 / 其它来源写入 baojs，逻辑与 mitm response 一致。"""
+    global _active_product_id
+
+    if not isinstance(data, dict):
+        return False
+    if data.get("status_code") not in (None, 0, 200):
+        return False
+
+    ensure_baojs_ready()
+    summary = _extract_summary(api_type, data, {})
+    product_id = product_id or _resolve_ids({}, {}, summary) or _find_product_id_deep(data)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if api_type == "product_detail":
+        product_id = product_id or _active_product_id
+        if product_id and product_id == _active_product_id:
+            _save_product(
+                product_id,
+                {
+                    "product_id": product_id,
+                    "updated_at": timestamp,
+                    "detail": {"summary": summary, "data": data.get("detail_info")},
+                },
+                export_txt=False,
+            )
+            print(f"[frida] product_detail -> baojs/{product_id}.json")
+            return True
+        return False
+
+    if not product_id:
+        return False
+
+    if api_type == "product_pack":
+        _active_product_id = product_id
+    elif product_id != _active_product_id:
+        print(f"[frida] 跳过 {api_type}（当前 {_active_product_id or '无'}，非 {product_id}）")
+        return False
+
+    export_txt = _should_export_txt(product_id, api_type)
+    patch = {
+        "product_id": product_id,
+        "updated_at": timestamp,
+        "summary": summary,
+        api_type: data,
+    }
+    txt_exported = _save_product(product_id, patch, export_txt=export_txt)
+    title = summary.get("title", "")
+    print(f"[frida] {api_type} -> baojs/{product_id}.json" + (" + baotxt" if txt_exported else ""))
+    if title:
+        print(f"  标题: {title[:60]}")
+    return True
 
 
 def response(flow: http.HTTPFlow) -> None:
+    global _active_product_id
     url = flow.request.pretty_url
     if _is_noise(url) or not flow.response:
         return
@@ -288,14 +435,15 @@ def response(flow: http.HTTPFlow) -> None:
     post = _parse_post_json(flow)
     summary = _extract_summary(api_type, data, {**query, **post})
     product_id = _resolve_ids(query, post, summary)
+    if not product_id and api_type == "product_skus":
+        product_id = _active_product_id
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if api_type == "product_detail":
-        if not product_id:
-            product_id = _resolve_ids({}, post, {})
-        if product_id:
+        product_id = _resolve_ids(query, post, summary) or _active_product_id
+        if product_id and product_id == _active_product_id:
             _save_product(
                 product_id,
                 {
@@ -303,6 +451,7 @@ def response(flow: http.HTTPFlow) -> None:
                     "updated_at": timestamp,
                     "detail": {"summary": summary, "data": data.get("detail_info")},
                 },
+                export_txt=False,
             )
             print(f"\n[product_detail] 已合并到 baojs/{product_id}.json")
         return
@@ -319,14 +468,22 @@ def response(flow: http.HTTPFlow) -> None:
     with SUMMARY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    txt_exported = False
     if product_id:
+        if api_type == "product_pack":
+            _active_product_id = product_id
+        elif product_id != _active_product_id:
+            print(f"\n[{api_type}] 跳过（当前详情页 {_active_product_id or '无'}，非 {product_id}）")
+            return
+
+        should_export = _should_export_txt(product_id, api_type)
         patch = {
             "product_id": product_id,
             "updated_at": timestamp,
             "summary": summary,
             api_type: data,
         }
-        _save_product(product_id, patch)
+        txt_exported = _save_product(product_id, patch, export_txt=should_export)
 
     title = summary.get("title", "")
     price = summary.get("price_yuan", "")
@@ -338,6 +495,6 @@ def response(flow: http.HTTPFlow) -> None:
     if price:
         print(f"  价格: ¥{price}")
     if product_id:
-        print(f"  已写入 output/summary.jsonl + baojs/{product_id}.json")
+        print(f"  已写入 baojs/{product_id}.json" + (" + baotxt" if txt_exported else "（txt 未改）"))
     else:
         print("  已写入 output/summary.jsonl")
